@@ -89,3 +89,58 @@ When you launch a goroutine, you don't know exactly when it will start, and you 
 - **Why not C or D:** whichever goroutine acquires the lock first runs all `1e7` iterations while holding it and finishes first — but which one wins the lock is exactly the nondeterministic part. Go's `sync.Mutex` gives no FIFO or fairness guarantee on acquisition.
 - **Seen in practice:** running the unsynchronized version of this program printed `B : begin` before `A : begin`, even though A was created first.
 - **Takeaway:** if you need ordering between goroutines, you must create it explicitly — a channel, a `sync.WaitGroup`, or a mutex around the part you care about. Never infer ordering from the order of `go` statements.
+
+---
+
+## Question #3 — RPC Error Semantics
+
+![iClicker Question 3: RPC Error Semantics](iclicker-assets/q3-rpc-error-semantics.png)
+
+**Question:** RPCs provide different semantics from a local call because RPCs introduce a different class of errors.
+
+**Options**
+
+- **A.** True
+- **B.** False
+
+**Answer: A — True**
+
+A local call either runs or the whole process dies with it — caller and callee share fate, memory, and address space. An RPC adds a network and a second machine, and with them a class of failures that has no local analogue: the request can be lost, the reply can be lost, the server can crash mid-execution, the network can partition, or the call can simply time out with the client unable to tell *which* of these happened.
+
+**Notes:**
+
+- **The ambiguity is the real problem.** On a timeout, the client cannot distinguish "the server never got it" from "the server ran it and the reply was lost." Local calls never leave you in that state.
+- **This is why RPC frameworks expose delivery semantics at all:**
+  - *At-least-once* — the client retries until it gets a reply, so the server may execute the same request multiple times. Fine for idempotent operations (`read(x)`), wrong for `withdraw(100)`.
+  - *At-most-once* — the client tags each RPC with a unique ID and the server dedups, so a request executes zero or one times. On an exception you know it ran zero or one times, but not which.
+  - *Exactly-once* is what you actually want and what a local call gives you for free; over an unreliable network it is not achievable in general.
+- **Other leaks in the abstraction:** RPC arguments are marshalled and copied, so there are no pointers or shared mutable state across the call; latency is orders of magnitude higher; and client and server must agree on an interface, type widths, and byte order.
+- **Takeaway:** stubs make an RPC *look* like a local call, but the abstraction is deliberately leaky. Code that treats a remote call as if it were local — no timeout handling, no retry policy, no idempotency story — is code that breaks the first time a packet drops.
+
+---
+
+## Question #4 — Garbage Collecting the Duplicate Table
+
+![iClicker Question 4: Garbage Collection](iclicker-assets/q4-reply-gc.png)
+
+**Question:** Garbage collection: when can the server discard old replies?
+
+**Options**
+
+- **A.** After a significantly long time period, e.g. after five seconds
+- **B.** After the client tells the server which replies it has received through an `ack`
+- **C.** After the client tells the server it has received all replies up through some `rpc_id`
+- **D.** All of the above
+- **E.** None of the above
+
+**Answer: C — after the client tells the server it has received all replies up through some `rpc_id`**
+
+At-most-once requires the server to keep a table of `rpc_id -> reply` so it can detect a duplicate and re-send the stored reply instead of re-executing. That table cannot grow forever. The rule for discarding an entry has to guarantee that the entry outlives every retry that could still reference it — and a cumulative "I have everything through #42" watermark is the mechanism that gives that guarantee cheaply. It is the TCP trick: the server drops the whole prefix in one shot, and the watermark piggybacks on the client's next request, so it costs no extra messages.
+
+**Notes:**
+
+- **Why not A — a timeout is a guess, not a guarantee.** Five seconds is an arbitrary number with no relationship to how long a retry can actually take. A retransmission that arrives at 5.1s hits an empty table, the server treats it as a fresh request and re-executes it, and you have silently fallen back to at-least-once — on exactly the workload where you were paying for at-most-once. A time bound only works if the client contractually promises to stop retrying within it, which means it is really a protocol change, not a GC policy.
+- **Why not B — per-reply acks are safe but strictly worse.** Acking individual replies does keep the server correct, but it costs an extra message per RPC and leaves a sparse table: the client may ack #7 while #5 is still outstanding, so the server must track a set of holes rather than a single number. A lost ack also strands that entry forever. C subsumes all of this — one integer instead of a set, self-healing because a later watermark covers any lost earlier one, and free because it rides on the next request.
+- **The state this buys you:** per client, the server keeps one number (the highest contiguous `rpc_id` the client has confirmed) plus the entries above it. Everything at or below the watermark is provably unreachable — the client has the reply, so it will never retry those.
+- **Degenerate case worth naming:** if the client is allowed only one outstanding RPC at a time, the arrival of request `n+1` is itself proof that reply `n` was received, so the server can discard everything `<= n` with no acks or watermarks at all. C is the generalization of this to a pipelined client.
+- **Takeaway:** a table entry must outlive every retry that could still reference it. Wall-clock time does not establish that; an explicit statement from the client about what it has received does.
